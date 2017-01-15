@@ -3,10 +3,14 @@ rust:
   - stable
   - beta
   - nightly
+cache: cargo
 # needed for `travis-cargo coveralls --no-sudo`
 addons:
   apt:
+    sources:
+      - sourceline: 'ppa:chris-lea/libsodium'
     packages:
+      - libsodium-dev
       - libcurl4-openssl-dev
       - libelf-dev
       - libdw-dev
@@ -47,8 +51,7 @@ before_install:
   - |
     if [[ "$TRAVIS_OS_NAME" == "linux" ]]
     then
-        ./scripts/verify-commit-messages.sh "$TRAVIS_COMMIT_RANGE" \
-        && ./scripts/bootstrap-ubuntu-14-04.sh
+        ./scripts/verify-commit-messages.sh "$TRAVIS_COMMIT_RANGE"
     fi
   - |
     if [[ "$TRAVIS_OS_NAME" == "osx" ]]
