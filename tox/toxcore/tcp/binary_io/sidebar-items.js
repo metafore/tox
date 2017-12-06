@@ -1,0 +1,1 @@
+initSidebarItems({"trait":[["FromBytes","The trait provides method to deserialize struct from raw bytes"],["ToBytes","The trait provides method to serialize struct into raw bytes"]]});
