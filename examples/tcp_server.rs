@@ -28,13 +28,339 @@ extern crate tokio_io;
 
 use tox::toxcore::crypto_core::*;
 use tox::toxcore::tcp::*;
+use tox::toxcore::tcp::packet::*;
 use tox::toxcore::tcp::codec;
 
-use futures::{Stream, Future};
+use std::collections::HashMap;
+use std::cell::RefCell;
+use std::rc::Rc;
+
+use futures::{Sink, Stream, Future, future};
+use futures::sync::mpsc;
 
 use tokio_io::*;
 use tokio_core::reactor::Core;
 use tokio_core::net::TcpListener;
+
+#[derive(Clone)]
+struct Client {
+    pk: PublicKey,
+    tx: mpsc::Sender<Packet>,
+    links: [Option<PublicKey>; 240],
+    ping_id: u64
+}
+
+impl Client {
+    fn new(tx: mpsc::Sender<Packet>, pk: &PublicKey) -> Client {
+        Client {
+            pk: *pk,
+            tx: tx,
+            links: [None; 240],
+            ping_id: 0
+        }
+    }
+    /// Some(index) if link exists
+    /// None if no links
+    fn get_connection_id(&self, to: &PublicKey) -> Option<u8> {
+        unimplemented!()
+    }
+    /// Some(index) if has been inserted or link existed
+    /// None if no free space to insert
+    fn insert_connection_id(&mut self, to: &PublicKey) -> Option<u8> {
+        match self.get_connection_id(to) {
+            Some(index) => Some(index),
+            None => {
+                unimplemented!()
+            }
+        }
+    }
+    fn is_linked(&self, to: &PublicKey) -> bool {
+        unimplemented!()
+        //self.links.borrow().iter().filter_map(|&x| x).any(|link| &link == to)
+    }
+    fn unlink(&self, pk: &PublicKey) {
+        unimplemented!()
+        /*
+        let links = self.links.borrow();
+        let index = links.iter().find(|link| link == pk);
+        if let index = Some(index) {
+            links[index] = None
+        }*/
+    }
+}
+
+#[derive(Clone)]
+struct Server {
+    connected_clients: Rc<RefCell<HashMap<PublicKey, Client>>>,
+}
+
+impl Server {
+    fn new() -> Server {
+        Server {
+            connected_clients: Rc::new(RefCell::new(HashMap::new()))
+        }
+    }
+    fn insert(&self, client: Client) {
+        self.connected_clients.borrow_mut()
+            .insert(client.pk, client);
+    }
+    fn remove(&self, pk: &PublicKey) -> Option<Client> {
+        self.connected_clients.borrow_mut()
+            .remove(pk)
+    }
+    /// Some(index) if exists or has been inserted
+    /// None if no space in Client::links
+    /*fn get_or_insert_connection_id(&self, pk: &PublicKey, other_pk: &PublicKey) -> Option<u8> {
+        unimplemented!()
+    }*/
+    fn send_connect_notification(&self, pk: &PublicKey, connection_id: u8) -> IoFuture<()> {
+        let clients = self.connected_clients.borrow();
+        let client = clients.get(pk).unwrap();
+        Box::new(
+            client.tx.clone().send(
+                Packet::ConnectNotification(ConnectNotification {
+                    connection_id: connection_id
+                })
+            )
+            .map(|_tx| ())
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "Failed to send ConnectNotification") )
+        )
+    }
+    fn send_route_response(&self, pk: &PublicKey, other_pk: &PublicKey, connection_id: u8) -> IoFuture<()> {
+        let clients = self.connected_clients.borrow();
+        let client = clients.get(pk).unwrap();
+        Box::new(
+            client.tx.clone().send(
+                Packet::RouteResponse(RouteResponse {
+                    connection_id: connection_id,
+                    pk: *other_pk
+                })
+            )
+            .map(|_tx| ())
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "Failed to send RouteResponse") )
+        )
+    }
+    fn process_packet(&self, pk: &PublicKey, packet: Packet) -> IoFuture<()> {
+        match packet {
+            Packet::RouteRequest(request) => {
+                if pk == &request.peer_pk {
+                    // send RouteResponse(0) if client requests its own pk
+                    return self.send_route_response(pk, pk, 0)
+                }
+                let index = {
+                    // check if client was already linked to pk
+                    let clients = self.connected_clients.borrow();
+                    let client = clients.get(pk).unwrap();
+                    client.get_connection_id(&request.peer_pk)
+                };
+                if let Some(index) = index {
+                    // send RouteResponse(index + 16) if client was already linked to pk
+                    return self.send_route_response(pk, &request.peer_pk, index + 16)
+                }
+                let index = {
+                    // try to insert new link into client.links
+                    let mut clients = self.connected_clients.borrow_mut();
+                    let mut client = clients.get_mut(pk).unwrap();
+                    client.insert_connection_id(&request.peer_pk)
+                };
+                match index {
+                    None => {
+                        // send RouteResponse(0) if no space to insert new link
+                        return self.send_route_response(pk, &request.peer_pk, 0)
+                    },
+                    Some(index) => {
+                        let other_index = {
+                            // check if current pk is linked inside other_client
+                            let clients = self.connected_clients.borrow();
+                            let other_client = clients.get(&request.peer_pk).unwrap();
+                            other_client.get_connection_id(pk)
+                        };
+                        if let Some(other_index) = other_index {
+                            // it is linked, send each other ConnectNotification
+                            let current_notification = self.send_connect_notification(pk, index).then(|_| Ok(()));
+                            let other_notification = self.send_connect_notification(&request.peer_pk, other_index).then(|_| Ok(()));
+                            return Box::new(
+                                self.send_route_response(pk, &request.peer_pk, index + 16)
+                                    .join(current_notification)
+                                    .join(other_notification)
+                                    .map(|_| ())
+                            )
+                        } else {
+                            return Box::new(
+                                self.send_route_response(pk, &request.peer_pk, index + 16)
+                            )
+                        }
+                    }
+                }
+            },
+            Packet::RouteResponse(_) => {
+                Box::new( future::err(
+                    std::io::Error::new(std::io::ErrorKind::Other,
+                        "Client must not send RouteResponse to server"
+                )))
+            },
+            Packet::ConnectNotification(_) => {
+                // ignore it for backward compatibility
+                Box::new( future::ok(()) )
+            },
+            Packet::DisconnectNotification(notification) => {
+                if notification.connection_id < 16 {
+                    return Box::new( future::err(
+                        std::io::Error::new(std::io::ErrorKind::Other,
+                            "DisconnectNotification.connection_id < 16"
+                    )))
+                }
+                let mut clients = self.connected_clients.borrow_mut();
+                let other_pk = {
+                    let mut client = clients.get_mut(pk).unwrap();
+                    let other_pk = client.links[notification.connection_id as usize - 16].take();
+                    if other_pk.is_none() {
+                        return Box::new( future::err(
+                            std::io::Error::new(std::io::ErrorKind::Other,
+                                "DisconnectNotification.connection_id is not linked"
+                        )))
+                    }
+                    other_pk.unwrap()
+                };
+
+                let mut other_client = clients.get_mut(&other_pk);
+                match other_client {
+                    None => {
+                        Box::new( future::ok(()) )
+                    },
+                    Some(other_client) => {
+                        if !other_client.is_linked(pk) {
+                            return Box::new( future::ok(()) )
+                        }
+
+                        let connection_id = other_client.get_connection_id(pk).unwrap();
+                        other_client.links[connection_id as usize].take();
+                        Box::new(
+                            other_client.tx.clone().send(
+                                Packet::DisconnectNotification(DisconnectNotification {
+                                    connection_id: connection_id
+                                })
+                            )
+                            .then(|_| Ok(())) // ignore if somehow failed to send it
+                        )
+                    }
+                }
+            },
+            Packet::PingRequest(request) => {
+                if request.ping_id == 0 {
+                    return Box::new( future::err(
+                        std::io::Error::new(std::io::ErrorKind::Other,
+                            "PingRequest.ping_id == 0"
+                    )))
+                }
+                let clients = self.connected_clients.borrow();
+                let client = clients.get(pk).unwrap();
+                Box::new(
+                    client.tx.clone().send(
+                        Packet::PongResponse(PongResponse { ping_id: request.ping_id })
+                    )
+                    .map(|_tx| ())
+                    .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "Failed to send PongResponse") )
+                )
+            },
+            Packet::PongResponse(response) => {
+                if response.ping_id == 0 {
+                    return Box::new( future::err(
+                        std::io::Error::new(std::io::ErrorKind::Other,
+                            "PongResponse.ping_id == 0"
+                    )))
+                }
+                let clients = self.connected_clients.borrow();
+                let client = clients.get(pk).unwrap();
+                if response.ping_id == client.ping_id {
+                    Box::new( future::ok(()) )
+                } else {
+                    Box::new( future::err(
+                        std::io::Error::new(std::io::ErrorKind::Other, "PongResponse.ping_id does not match")
+                    ))
+                }
+            },
+            Packet::OobSend(oob) => {
+                if oob.data.len() == 0 || oob.data.len() > 1024 {
+                    return Box::new( future::err(
+                        std::io::Error::new(std::io::ErrorKind::Other,
+                            "OobSend wrong data length"
+                    )))
+                }
+                let clients = self.connected_clients.borrow();
+                let other_client = clients.get(&oob.destination_pk);
+                match other_client {
+                    None => {
+                        // ignore it for backward compatibility
+                        Box::new( future::ok(()) )
+                    },
+                    Some(other_client) => {
+                        Box::new(
+                            other_client.tx.clone().send(
+                                Packet::OobReceive(OobReceive {
+                                    sender_pk: *pk,
+                                    data: oob.data
+                                })
+                            )
+                            .then(|_| Ok(())) // ignore if somehow failed to send it
+                        )
+                    }
+                }
+            },
+            Packet::OobReceive(_) => {
+                Box::new( future::err(
+                    std::io::Error::new(std::io::ErrorKind::Other,
+                        "Client must not send OobReceive to server"
+                )))
+            },
+            Packet::Data(data) => {
+                if data.connection_id < 16 {
+                    return Box::new( future::err(
+                        std::io::Error::new(std::io::ErrorKind::Other,
+                            "Data.connection_id < 16"
+                    )))
+                }
+                let clients = self.connected_clients.borrow();
+                let client = clients.get(pk).unwrap();
+                let other_pk = client.links[data.connection_id as usize - 16];
+                if other_pk.is_none() {
+                    return Box::new( future::err(
+                        std::io::Error::new(std::io::ErrorKind::Other,
+                            "Data.connection_id is not linked"
+                    )))
+                }
+                let other_pk = other_pk.unwrap();
+                let other_client = clients.get(&other_pk).unwrap();
+                if !other_client.is_linked(pk) {
+                    // other_client has not sent RouteRequest yet, so we drop Data request
+                    return Box::new( future::ok(()) )
+                }
+                let connection_id = other_client.get_connection_id(pk).unwrap();
+
+                Box::new(
+                    other_client.tx.clone().send(
+                        Packet::Data(Data {
+                            connection_id: connection_id + 16,
+                            data: data.data
+                        })
+                    )
+                    .map(|_tx| ())
+                    .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "Failed to send Data") )
+                )
+            },
+            /*
+            _ => {
+                Box::new( future::ok(()) )
+            }
+            */
+        }
+    }
+}
+
+fn _debugf<F: Future<Item = (), Error = ()>>(_: F) {}
+
+// Like `_debugf` but for `Stream`s instead of `Future`s.
+fn _debugs<S: Stream<Item = (), Error = ()>>(_: S) {}
 
 fn main() {
     // Some constant keypair
@@ -53,20 +379,54 @@ fn main() {
 
     println!("Listening on {} using PK {:?}", addr, &server_pk.0);
 
+    let server_inner = Server::new();
+
     let server = listener.incoming().for_each(|(socket, addr)| {
         println!("A new client connected from {}", addr);
 
-        let process_messages = make_server_handshake(socket, server_sk.clone())
-            .and_then(|(socket, channel, client_pk)| {
+        let server_inner_c = server_inner.clone();
+        let register_client = make_server_handshake(socket, server_sk.clone())
+            .map_err(|e| {
+                println!("handshake error: {}", e);
+                e
+            })
+            .and_then(move |(socket, channel, client_pk)| {
                 println!("Handshake for client {:?} complited", &client_pk);
-                let secure_socket = socket.framed(codec::Codec::new(channel));
-                let (_to_client, _from_client) = secure_socket.split();
-                // use example https://github.com/jgallagher/tokio-chat-example/blob/master/tokio-chat-server/src/main.rs
-                Ok(())
-            }).map_err(|e| {
-                println!("error: {}", e);
+                let (tx, rx) = mpsc::channel(8);
+                server_inner_c.insert(Client::new(tx, &client_pk));
+
+                Ok((socket, channel, client_pk, rx))
             });
-        handle.spawn(process_messages);
+        let server_inner_c = server_inner.clone();
+        let process_connection = register_client
+            .and_then(move |(socket, channel, client_pk, rx)| {
+                let secure_socket = socket.framed(codec::Codec::new(channel));
+                let (to_client, from_client) = secure_socket.split();
+
+                // reader = for each Packet from client process it
+                let reader = from_client.for_each(move |packet| {
+                    server_inner_c.process_packet(&client_pk, packet)
+                });
+
+                // writer = for each Packet from rx send it to client
+                let writer = rx
+                    .map_err(|()| unreachable!("rx can't fail"))
+                    .fold(to_client, |to_client, packet| {
+                        to_client.send(packet)
+                    })
+                    // drop to_client when rx stream is exhausted
+                    .map(|_to_client| ());
+
+                // TODO ping request = each 30s send PingRequest to client
+
+                reader.select(writer).map(|_| ()).map_err(|(err, _)| err)
+            });
+        handle.spawn(process_connection.then(|_x| {
+            // TODO shutdown client, send notifications etc
+            println!("end of processing {:?}", _x);
+
+            future::ok(())
+        }));
 
         Ok(())
     });
