@@ -76,23 +76,27 @@ impl Client {
             }
         }
     }
-    fn send_impl(&self, packet: Packet)
-        -> futures::sink::Send<mpsc::Sender<Packet>> {
-        self.tx.clone().send(packet)
+    fn send_impl(&self, packet: Packet) -> IoFuture<()> {
+        Box::new(self.tx.clone() // clone tx sender for 1 send only
+            .send(packet)
+            .map(|_tx| ()) // ignore tx because it was cloned
+            .map_err(|_| {
+                // This may only happen if rx is gone
+                // So cast SendError<T> to a corresponding std::io::Error
+                std::io::Error::from(std::io::ErrorKind::UnexpectedEof)
+            })
+        )
     }
     fn send(&self, packet: Packet) -> IoFuture<()> {
         Box::new(self.send_impl(packet)
-            .map(|_tx| ()) // ignore tx because it was cloned
             .map_err(|e| {
                 debug!("send: {:?}", e);
-                // TODO keep original error
-                std::io::Error::new(std::io::ErrorKind::Other, "Failed to send")
+                e
             })
         )
     }
     fn send_ignore_error(&self, packet: Packet) -> IoFuture<()> {
         Box::new(self.send_impl(packet)
-            .map(|_tx| ()) // ignore tx because it was cloned
             .then(|e| {
                 debug!("send_ignore_error: {:?}", e);
                 Ok(()) // ignore if somehow failed to send it
