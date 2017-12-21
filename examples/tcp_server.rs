@@ -26,6 +26,8 @@ extern crate nom;
 extern crate tokio_core;
 extern crate tokio_io;
 
+#[macro_use] extern crate log;
+
 use tox::toxcore::crypto_core::*;
 use tox::toxcore::tcp::*;
 use tox::toxcore::tcp::packet::*;
@@ -87,48 +89,65 @@ impl Client {
             links[index] = None
         }*/
     }
+    fn send_impl(&self, packet: Packet)
+        -> futures::sink::Send<mpsc::Sender<Packet>> {
+        self.tx.clone().send(packet)
+    }
+    fn send(&self, packet: Packet) -> IoFuture<()> {
+        Box::new(self.send_impl(packet)
+            .map(|_tx| ()) // ignore tx because it was cloned
+            .map_err(|e| {
+                debug!("send: {:?}", e);
+                // TODO keep original error
+                std::io::Error::new(std::io::ErrorKind::Other, "Failed to send")
+            })
+        )
+    }
+    fn send_ignore_error(&self, packet: Packet) -> IoFuture<()> {
+        Box::new(self.send_impl(packet)
+            .map(|_tx| ()) // ignore tx because it was cloned
+            .then(|e| {
+                debug!("send_ignore_error: {:?}", e);
+                Ok(()) // ignore if somehow failed to send it
+            })
+        )
+    }
     fn send_route_response(&self, pk: &PublicKey, connection_id: u8) -> IoFuture<()> {
-        Box::new(
-            self.tx.clone().send(
-                Packet::RouteResponse(RouteResponse {
-                    connection_id: connection_id,
-                    pk: *pk
-                })
-            )
-            .map(|_tx| ())
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "Failed to send RouteResponse") )
+        self.send(
+            Packet::RouteResponse(RouteResponse {
+                connection_id: connection_id,
+                pk: *pk
+            })
         )
     }
     fn send_connect_notification(&self, connection_id: u8) -> IoFuture<()> {
-        Box::new(
-            self.tx.clone().send(
-                Packet::ConnectNotification(ConnectNotification {
-                    connection_id: connection_id
-                })
-            )
-            .then(|_| Ok(())) // ignore if somehow failed to send it
+        self.send_ignore_error(
+            Packet::ConnectNotification(ConnectNotification {
+                connection_id: connection_id
+            })
         )
     }
     fn send_disconnect_notification(&self, connection_id: u8) -> IoFuture<()> {
-        Box::new(
-            self.tx.clone().send(
-                Packet::DisconnectNotification(DisconnectNotification {
-                    connection_id: connection_id
-                })
-            )
-            .then(|_| Ok(())) // ignore if somehow failed to send it
+        self.send_ignore_error(
+            Packet::DisconnectNotification(DisconnectNotification {
+                connection_id: connection_id
+            })
+        )
+    }
+    fn send_oob(&self, sender_pk: &PublicKey, data: Vec<u8>) -> IoFuture<()> {
+        self.send_ignore_error(
+            Packet::OobReceive(OobReceive {
+                sender_pk: *sender_pk,
+                data: data
+            })
         )
     }
     fn send_data(&self, connection_id: u8, data: Vec<u8>) -> IoFuture<()> {
-        Box::new(
-            self.tx.clone().send(
-                Packet::Data(Data {
-                    connection_id: connection_id,
-                    data: data
-                })
-            )
-            .map(|_tx| ())
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "Failed to send Data") )
+        self.send(
+            Packet::Data(Data {
+                connection_id: connection_id,
+                data: data
+            })
         )
     }
 }
@@ -318,23 +337,11 @@ impl Server {
                     )))
                 }
                 let clients = self.connected_clients.borrow();
-                let other_client = clients.get(&oob.destination_pk);
-                match other_client {
-                    None => {
-                        // ignore it for backward compatibility
-                        Box::new( future::ok(()) )
-                    },
-                    Some(other_client) => {
-                        Box::new(
-                            other_client.tx.clone().send(
-                                Packet::OobReceive(OobReceive {
-                                    sender_pk: *pk,
-                                    data: oob.data
-                                })
-                            )
-                            .then(|_| Ok(())) // ignore if somehow failed to send it
-                        )
-                    }
+                if let Some(other_client) = clients.get(&oob.destination_pk) {
+                    other_client.send_oob(pk, oob.data)
+                } else {
+                    // Do nothing because there is no other_client connected to server
+                    Box::new( future::ok(()) )
                 }
             },
             Packet::OobReceive(_) => {
