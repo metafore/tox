@@ -220,9 +220,7 @@ impl Server {
                         )
                     } else {
                         // if not, send RouteResponse(index + 16) only to current client
-                        return Box::new(
-                            client.send_route_response(&request.peer_pk, index + 16)
-                        )
+                        client.send_route_response(&request.peer_pk, index + 16)
                     }
                 } else {
                     // Do nothing because
@@ -296,7 +294,7 @@ impl Server {
                 if let Some(client) = clients.get(pk) {
                     client.send_pong_response(request.ping_id)
                 } else {
-                    return Box::new( future::err(
+                    Box::new( future::err(
                         std::io::Error::new(std::io::ErrorKind::Other,
                             "PingRequest: no such PK"
                     )) )
