@@ -134,6 +134,13 @@ impl Client {
             })
         )
     }
+    fn send_pong_response(&self, ping_id: u64) -> IoFuture<()> {
+        self.send(
+            Packet::PongResponse(PongResponse {
+                ping_id: ping_id
+            })
+        )
+    }
     fn send_oob(&self, sender_pk: &PublicKey, data: Vec<u8>) -> IoFuture<()> {
         self.send_ignore_error(
             Packet::OobReceive(OobReceive {
@@ -303,14 +310,14 @@ impl Server {
                     )))
                 }
                 let clients = self.connected_clients.borrow();
-                let client = clients.get(pk).unwrap();
-                Box::new(
-                    client.tx.clone().send(
-                        Packet::PongResponse(PongResponse { ping_id: request.ping_id })
-                    )
-                    .map(|_tx| ())
-                    .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "Failed to send PongResponse") )
-                )
+                if let Some(client) = clients.get(pk) {
+                    client.send_pong_response(request.ping_id)
+                } else {
+                    return Box::new( future::err(
+                        std::io::Error::new(std::io::ErrorKind::Other,
+                            "PingRequest: no such PK"
+                    )) )
+                }
             },
             Packet::PongResponse(response) => {
                 if response.ping_id == 0 {
@@ -320,13 +327,19 @@ impl Server {
                     )))
                 }
                 let clients = self.connected_clients.borrow();
-                let client = clients.get(pk).unwrap();
-                if response.ping_id == client.ping_id {
-                    Box::new( future::ok(()) )
+                if let Some(client) = clients.get(pk) {
+                    if response.ping_id == client.ping_id {
+                        Box::new( future::ok(()) )
+                    } else {
+                        Box::new( future::err(
+                            std::io::Error::new(std::io::ErrorKind::Other, "PongResponse.ping_id does not match")
+                        ))
+                    }
                 } else {
-                    Box::new( future::err(
-                        std::io::Error::new(std::io::ErrorKind::Other, "PongResponse.ping_id does not match")
-                    ))
+                    return Box::new( future::err(
+                        std::io::Error::new(std::io::ErrorKind::Other,
+                            "PongResponse: no such PK"
+                    )) )
                 }
             },
             Packet::OobSend(oob) => {
