@@ -87,6 +87,50 @@ impl Client {
             links[index] = None
         }*/
     }
+    fn send_route_response(&self, pk: &PublicKey, connection_id: u8) -> IoFuture<()> {
+        Box::new(
+            self.tx.clone().send(
+                Packet::RouteResponse(RouteResponse {
+                    connection_id: connection_id,
+                    pk: *pk
+                })
+            )
+            .map(|_tx| ())
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "Failed to send RouteResponse") )
+        )
+    }
+    fn send_connect_notification(&self, connection_id: u8) -> IoFuture<()> {
+        Box::new(
+            self.tx.clone().send(
+                Packet::ConnectNotification(ConnectNotification {
+                    connection_id: connection_id
+                })
+            )
+            .then(|_| Ok(())) // ignore if somehow failed to send it
+        )
+    }
+    fn send_disconnect_notification(&self, connection_id: u8) -> IoFuture<()> {
+        Box::new(
+            self.tx.clone().send(
+                Packet::DisconnectNotification(DisconnectNotification {
+                    connection_id: connection_id
+                })
+            )
+            .then(|_| Ok(())) // ignore if somehow failed to send it
+        )
+    }
+    fn send_data(&self, connection_id: u8, data: Vec<u8>) -> IoFuture<()> {
+        Box::new(
+            self.tx.clone().send(
+                Packet::Data(Data {
+                    connection_id: connection_id,
+                    data: data
+                })
+            )
+            .map(|_tx| ())
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "Failed to send Data") )
+        )
+    }
 }
 
 #[derive(Clone)]
@@ -108,37 +152,25 @@ impl Server {
         self.connected_clients.borrow_mut()
             .remove(pk)
     }
-    /// Some(index) if exists or has been inserted
-    /// None if no space in Client::links
-    /*fn get_or_insert_connection_id(&self, pk: &PublicKey, other_pk: &PublicKey) -> Option<u8> {
-        unimplemented!()
-    }*/
     fn send_connect_notification(&self, pk: &PublicKey, connection_id: u8) -> IoFuture<()> {
         let clients = self.connected_clients.borrow();
-        let client = clients.get(pk).unwrap();
-        Box::new(
-            client.tx.clone().send(
-                Packet::ConnectNotification(ConnectNotification {
-                    connection_id: connection_id
-                })
-            )
-            .map(|_tx| ())
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "Failed to send ConnectNotification") )
-        )
+        match clients.get(pk) {
+            None => Box::new( future::err(
+                std::io::Error::new(std::io::ErrorKind::Other,
+                    format!("send_connect_notification: no such PK {:?}", pk)
+            ))),
+            Some(client) => client.send_connect_notification(connection_id)
+        }
     }
     fn send_route_response(&self, pk: &PublicKey, other_pk: &PublicKey, connection_id: u8) -> IoFuture<()> {
         let clients = self.connected_clients.borrow();
-        let client = clients.get(pk).unwrap();
-        Box::new(
-            client.tx.clone().send(
-                Packet::RouteResponse(RouteResponse {
-                    connection_id: connection_id,
-                    pk: *other_pk
-                })
-            )
-            .map(|_tx| ())
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "Failed to send RouteResponse") )
-        )
+        match clients.get(pk) {
+            None => Box::new( future::err(
+                std::io::Error::new(std::io::ErrorKind::Other,
+                    format!("send_route_response: no such PK {:?}", pk)
+            ))),
+            Some(client) => client.send_route_response(other_pk, connection_id)
+        }
     }
     fn process_packet(&self, pk: &PublicKey, packet: Packet) -> IoFuture<()> {
         match packet {
@@ -177,6 +209,7 @@ impl Server {
                         };
                         if let Some(other_index) = other_index {
                             // it is linked, send each other ConnectNotification
+                            // we don't care if connect notifications fail
                             let current_notification = self.send_connect_notification(pk, index).then(|_| Ok(()));
                             let other_notification = self.send_connect_notification(&request.peer_pk, other_index).then(|_| Ok(()));
                             return Box::new(
@@ -212,6 +245,8 @@ impl Server {
                 }
                 let mut clients = self.connected_clients.borrow_mut();
                 let other_pk = {
+                    // take other_pk from client.links by connection_id
+                    // and unlink it if any
                     let mut client = clients.get_mut(pk).unwrap();
                     let other_pk = client.links[notification.connection_id as usize - 16].take();
                     if other_pk.is_none() {
@@ -226,6 +261,8 @@ impl Server {
                 let mut other_client = clients.get_mut(&other_pk);
                 match other_client {
                     None => {
+                        // other client is not connected to the server
+                        // so ignore it
                         Box::new( future::ok(()) )
                     },
                     Some(other_client) => {
@@ -235,14 +272,7 @@ impl Server {
 
                         let connection_id = other_client.get_connection_id(pk).unwrap();
                         other_client.links[connection_id as usize].take();
-                        Box::new(
-                            other_client.tx.clone().send(
-                                Packet::DisconnectNotification(DisconnectNotification {
-                                    connection_id: connection_id
-                                })
-                            )
-                            .then(|_| Ok(())) // ignore if somehow failed to send it
-                        )
+                        return other_client.send_disconnect_notification(connection_id + 16);
                     }
                 }
             },
@@ -321,32 +351,36 @@ impl Server {
                     )))
                 }
                 let clients = self.connected_clients.borrow();
-                let client = clients.get(pk).unwrap();
-                let other_pk = client.links[data.connection_id as usize - 16];
-                if other_pk.is_none() {
-                    return Box::new( future::err(
-                        std::io::Error::new(std::io::ErrorKind::Other,
-                            "Data.connection_id is not linked"
-                    )))
+                let other_pk = {
+                    if let Some(client) = clients.get(pk) {
+                        if let Some(other_pk) = client.links[data.connection_id as usize - 16] {
+                            other_pk
+                        } else {
+                            return Box::new( future::err(
+                                std::io::Error::new(std::io::ErrorKind::Other,
+                                    "Data.connection_id is not linked"
+                            )))
+                        }
+                    } else {
+                        return Box::new( future::err(
+                            std::io::Error::new(std::io::ErrorKind::Other,
+                                "Data: no such PK"
+                        )))
+                    }
+                };
+                if let Some(other_client) = clients.get(&other_pk) {
+                    let connection_id = other_client.get_connection_id(pk).map(|x| x + 16);
+                    if let Some(connection_id) = connection_id {
+                        other_client.send_data(connection_id, data.data)
+                    } else {
+                        // Do nothing because
+                        // other_client has not sent RouteRequest yet to connect to this client
+                        Box::new( future::ok(()) )
+                    }
+                } else {
+                    // Do nothing because there is no other_client connected to server
+                    Box::new( future::ok(()) )
                 }
-                let other_pk = other_pk.unwrap();
-                let other_client = clients.get(&other_pk).unwrap();
-                if !other_client.is_linked(pk) {
-                    // other_client has not sent RouteRequest yet, so we drop Data request
-                    return Box::new( future::ok(()) )
-                }
-                let connection_id = other_client.get_connection_id(pk).unwrap();
-
-                Box::new(
-                    other_client.tx.clone().send(
-                        Packet::Data(Data {
-                            connection_id: connection_id + 16,
-                            data: data.data
-                        })
-                    )
-                    .map(|_tx| ())
-                    .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "Failed to send Data") )
-                )
             },
             /*
             _ => {
