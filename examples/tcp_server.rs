@@ -76,19 +76,6 @@ impl Client {
             }
         }
     }
-    fn is_linked(&self, to: &PublicKey) -> bool {
-        unimplemented!()
-        //self.links.borrow().iter().filter_map(|&x| x).any(|link| &link == to)
-    }
-    fn unlink(&self, pk: &PublicKey) {
-        unimplemented!()
-        /*
-        let links = self.links.borrow();
-        let index = links.iter().find(|link| link == pk);
-        if let index = Some(index) {
-            links[index] = None
-        }*/
-    }
     fn send_impl(&self, packet: Packet)
         -> futures::sink::Send<mpsc::Sender<Packet>> {
         self.tx.clone().send(packet)
@@ -178,78 +165,65 @@ impl Server {
         self.connected_clients.borrow_mut()
             .remove(pk)
     }
-    fn send_connect_notification(&self, pk: &PublicKey, connection_id: u8) -> IoFuture<()> {
-        let clients = self.connected_clients.borrow();
-        match clients.get(pk) {
-            None => Box::new( future::err(
-                std::io::Error::new(std::io::ErrorKind::Other,
-                    format!("send_connect_notification: no such PK {:?}", pk)
-            ))),
-            Some(client) => client.send_connect_notification(connection_id)
-        }
-    }
-    fn send_route_response(&self, pk: &PublicKey, other_pk: &PublicKey, connection_id: u8) -> IoFuture<()> {
-        let clients = self.connected_clients.borrow();
-        match clients.get(pk) {
-            None => Box::new( future::err(
-                std::io::Error::new(std::io::ErrorKind::Other,
-                    format!("send_route_response: no such PK {:?}", pk)
-            ))),
-            Some(client) => client.send_route_response(other_pk, connection_id)
-        }
-    }
     fn process_packet(&self, pk: &PublicKey, packet: Packet) -> IoFuture<()> {
         match packet {
             Packet::RouteRequest(request) => {
-                if pk == &request.peer_pk {
-                    // send RouteResponse(0) if client requests its own pk
-                    return self.send_route_response(pk, pk, 0)
-                }
                 let index = {
                     // check if client was already linked to pk
-                    let clients = self.connected_clients.borrow();
-                    let client = clients.get(pk).unwrap();
-                    client.get_connection_id(&request.peer_pk)
-                };
-                if let Some(index) = index {
-                    // send RouteResponse(index + 16) if client was already linked to pk
-                    return self.send_route_response(pk, &request.peer_pk, index + 16)
-                }
-                let index = {
-                    // try to insert new link into client.links
                     let mut clients = self.connected_clients.borrow_mut();
-                    let mut client = clients.get_mut(pk).unwrap();
-                    client.insert_connection_id(&request.peer_pk)
-                };
-                match index {
-                    None => {
-                        // send RouteResponse(0) if no space to insert new link
-                        return self.send_route_response(pk, &request.peer_pk, 0)
-                    },
-                    Some(index) => {
-                        let other_index = {
-                            // check if current pk is linked inside other_client
-                            let clients = self.connected_clients.borrow();
-                            let other_client = clients.get(&request.peer_pk).unwrap();
-                            other_client.get_connection_id(pk)
-                        };
-                        if let Some(other_index) = other_index {
-                            // it is linked, send each other ConnectNotification
-                            // we don't care if connect notifications fail
-                            let current_notification = self.send_connect_notification(pk, index).then(|_| Ok(()));
-                            let other_notification = self.send_connect_notification(&request.peer_pk, other_index).then(|_| Ok(()));
-                            return Box::new(
-                                self.send_route_response(pk, &request.peer_pk, index + 16)
-                                    .join(current_notification)
-                                    .join(other_notification)
-                                    .map(|_| ())
-                            )
-                        } else {
-                            return Box::new(
-                                self.send_route_response(pk, &request.peer_pk, index + 16)
-                            )
+                    if let Some(client) = clients.get_mut(pk) {
+                        if pk == &request.peer_pk {
+                            // send RouteResponse(0) if client requests its own pk
+                            return client.send_route_response(pk, 0)
                         }
+                        let index = client.get_connection_id(&request.peer_pk);
+                        if let Some(index) = index {
+                            // send RouteResponse(index + 16) if client was already linked to pk
+                            return client.send_route_response(&request.peer_pk, index + 16)
+                        } else {
+                            // try to insert new link into client.links
+                            let index = client.insert_connection_id(&request.peer_pk);
+                            if let Some(index) = index {
+                                index
+                            } else {
+                                // send RouteResponse(0) if no space to insert new link
+                                return client.send_route_response(&request.peer_pk, 0)
+                            }
+                        }
+                    } else {
+                        return Box::new( future::err(
+                            std::io::Error::new(std::io::ErrorKind::Other,
+                                "RouteRequest: no such PK"
+                        )))
                     }
+                };
+                let clients = self.connected_clients.borrow();
+                let client = clients.get(&request.peer_pk).unwrap(); // can not fail
+                if let Some(other_client) = clients.get(&request.peer_pk) {
+                    // check if current pk is linked inside other_client
+                    let other_index = other_client.get_connection_id(pk);
+                    if let Some(other_index) = other_index {
+                        // the are both linked, send RouteResponse and
+                        // send each other ConnectNotification
+                        // we don't care if connect notifications fail
+                        let current_notification = client.send_connect_notification(index + 16);
+                        let other_notification = other_client.send_connect_notification(other_index + 16);
+                        return Box::new(
+                            client.send_route_response(&request.peer_pk, index + 16)
+                                .join(current_notification)
+                                .join(other_notification)
+                                .map(|_| ())
+                        )
+                    } else {
+                        // if not, send RouteResponse(index + 16) only to current client
+                        return Box::new(
+                            client.send_route_response(&request.peer_pk, index + 16)
+                        )
+                    }
+                } else {
+                    // Do nothing because
+                    // other_client has not sent RouteRequest yet to connect to this client
+                    Box::new( future::ok(()) )
                 }
             },
             Packet::RouteResponse(_) => {
@@ -415,11 +389,6 @@ impl Server {
         }
     }
 }
-
-fn _debugf<F: Future<Item = (), Error = ()>>(_: F) {}
-
-// Like `_debugf` but for `Stream`s instead of `Future`s.
-fn _debugs<S: Stream<Item = (), Error = ()>>(_: S) {}
 
 fn main() {
     // Some constant keypair
