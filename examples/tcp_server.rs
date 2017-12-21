@@ -449,12 +449,20 @@ fn main() {
 
                 // TODO ping request = each 30s send PingRequest to client
 
-                reader.select(writer).map(|_| ()).map_err(|(err, _)| err)
+                reader.select(writer)
+                    .map(|_| ())
+                    .map_err(move |(err, _select_next)| {
+                        println!("Processing client {:?} ended with error: {:?}", &client_pk, err);
+                        err
+                    })
+                    .then(move |r| {
+                        // TODO shutdown client, send notifications etc
+                        println!("shutdown PK {:?}", &client_pk);
+                        future::result(r)
+                    })
             });
-        handle.spawn(process_connection.then(|_x| {
-            // TODO shutdown client, send notifications etc
-            println!("end of processing {:?}", _x);
-
+        handle.spawn(process_connection.then(|r| {
+            println!("end of processing with result {:?}", r);
             future::ok(())
         }));
 
