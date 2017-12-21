@@ -271,35 +271,40 @@ impl Server {
                 }
                 let mut clients = self.connected_clients.borrow_mut();
                 let other_pk = {
-                    // take other_pk from client.links by connection_id
-                    // and unlink it if any
-                    let mut client = clients.get_mut(pk).unwrap();
-                    let other_pk = client.links[notification.connection_id as usize - 16].take();
-                    if other_pk.is_none() {
+                    if let Some(client) = clients.get_mut(pk) {
+                        // unlink other_pk from client.links if any
+                        // and return previous value
+                        let link = client.links[notification.connection_id as usize - 16].take();
+                        if let Some(other_pk) = link {
+                            other_pk
+                        } else {
+                            return Box::new( future::err(
+                                std::io::Error::new(std::io::ErrorKind::Other,
+                                    "DisconnectNotification.connection_id is not linked"
+                            )))
+                        }
+                    } else {
                         return Box::new( future::err(
                             std::io::Error::new(std::io::ErrorKind::Other,
-                                "DisconnectNotification.connection_id is not linked"
+                                "DisconnectNotification: no such PK"
                         )))
                     }
-                    other_pk.unwrap()
                 };
 
-                let mut other_client = clients.get_mut(&other_pk);
-                match other_client {
-                    None => {
-                        // other client is not connected to the server
-                        // so ignore it
-                        Box::new( future::ok(()) )
-                    },
-                    Some(other_client) => {
-                        if !other_client.is_linked(pk) {
-                            return Box::new( future::ok(()) )
-                        }
-
-                        let connection_id = other_client.get_connection_id(pk).unwrap();
+                if let Some(other_client) = clients.get_mut(&other_pk) {
+                    let connection_id = other_client.get_connection_id(pk).map(|x| x + 16);
+                    if let Some(connection_id) = connection_id {
+                        // unlink pk from other_client it and send notification
                         other_client.links[connection_id as usize].take();
-                        return other_client.send_disconnect_notification(connection_id + 16);
+                        other_client.send_disconnect_notification(connection_id)
+                    } else {
+                        // Do nothing because
+                        // other_client has not sent RouteRequest yet to connect to this client
+                        Box::new( future::ok(()) )
                     }
+                } else {
+                    // other_client is not connected to the server, so ignore it
+                    Box::new( future::ok(()) )
                 }
             },
             Packet::PingRequest(request) => {
