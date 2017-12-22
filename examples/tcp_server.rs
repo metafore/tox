@@ -468,13 +468,15 @@ fn main() {
                 // reader = for each Packet from client process it
                 let server_inner_c_c = server_inner_c.clone();
                 let reader = from_client.for_each(move |packet| {
-                    server_inner_c_c.process_packet(&client_pk, packet)
+                    println!("Handle {:?} => {:?}", client_pk, packet);
+                    server_inner_c_c.handle_packet(&client_pk, packet)
                 });
 
                 // writer = for each Packet from rx send it to client
                 let writer = rx
                     .map_err(|()| unreachable!("rx can't fail"))
-                    .fold(to_client, |to_client, packet| {
+                    .fold(to_client, move |to_client, packet| {
+                        println!("Send {:?} => {:?}", client_pk, packet);
                         to_client.send(packet)
                     })
                     // drop to_client when rx stream is exhausted
