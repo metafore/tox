@@ -42,119 +42,7 @@ use tokio_io::*;
 use tokio_core::reactor::Core;
 use tokio_core::net::TcpListener;
 
-#[derive(Clone)]
-struct Client {
-    pk: PublicKey,
-    tx: mpsc::Sender<Packet>,
-    links: [Option<PublicKey>; 240],
-    ping_id: u64
-}
-
-impl Client {
-    fn new(tx: mpsc::Sender<Packet>, pk: &PublicKey) -> Client {
-        Client {
-            pk: *pk,
-            tx: tx,
-            links: [None; 240],
-            ping_id: 0
-        }
-    }
-    /// Some(index) if link exists
-    /// None if no links
-    fn get_connection_id(&self, to: &PublicKey) -> Option<u8> {
-        // rposition - backward compatibility (try to find from the end)
-        self.links.iter().rposition(|&link| link == Some(*to)).map(|x| x as u8)
-    }
-    /// Some(index) if has been inserted or link existed
-    /// None if no free space to insert
-    fn insert_connection_id(&mut self, to: &PublicKey) -> Option<u8> {
-        match self.get_connection_id(to) {
-            Some(index) => Some(index), // already inserted
-            None => {
-                // rposition - backward compatibility (try to insert from the end)
-                if let Some(index) = self.links.iter().rposition(|link| link.is_none()) {
-                    self.links[index] = Some(*to);
-                    Some(index as u8)
-                } else {
-                    None
-                }
-            }
-        }
-    }
-    fn send_impl(&self, packet: Packet) -> IoFuture<()> {
-        println!("Send {:?} => {:?}", self.pk, packet);
-        Box::new(self.tx.clone() // clone tx sender for 1 send only
-            .send(packet)
-            .map(|_tx| ()) // ignore tx because it was cloned
-            .map_err(|_| {
-                // This may only happen if rx is gone
-                // So cast SendError<T> to a corresponding std::io::Error
-                std::io::Error::from(std::io::ErrorKind::UnexpectedEof)
-            })
-        )
-    }
-    fn send(&self, packet: Packet) -> IoFuture<()> {
-        Box::new(self.send_impl(packet)
-            .map_err(|e| {
-                println!("send: {:?}", e);
-                e
-            })
-        )
-    }
-    fn send_ignore_error(&self, packet: Packet) -> IoFuture<()> {
-        Box::new(self.send_impl(packet)
-            .then(|e| {
-                println!("send_ignore_error: {:?}", e);
-                Ok(()) // ignore if somehow failed to send it
-            })
-        )
-    }
-    fn send_route_response(&self, pk: &PublicKey, connection_id: u8) -> IoFuture<()> {
-        self.send(
-            Packet::RouteResponse(RouteResponse {
-                connection_id: connection_id,
-                pk: *pk
-            })
-        )
-    }
-    fn send_connect_notification(&self, connection_id: u8) -> IoFuture<()> {
-        self.send_ignore_error(
-            Packet::ConnectNotification(ConnectNotification {
-                connection_id: connection_id
-            })
-        )
-    }
-    fn send_disconnect_notification(&self, connection_id: u8) -> IoFuture<()> {
-        self.send_ignore_error(
-            Packet::DisconnectNotification(DisconnectNotification {
-                connection_id: connection_id
-            })
-        )
-    }
-    fn send_pong_response(&self, ping_id: u64) -> IoFuture<()> {
-        self.send(
-            Packet::PongResponse(PongResponse {
-                ping_id: ping_id
-            })
-        )
-    }
-    fn send_oob(&self, sender_pk: &PublicKey, data: Vec<u8>) -> IoFuture<()> {
-        self.send_ignore_error(
-            Packet::OobReceive(OobReceive {
-                sender_pk: *sender_pk,
-                data: data
-            })
-        )
-    }
-    fn send_data(&self, connection_id: u8, data: Vec<u8>) -> IoFuture<()> {
-        self.send(
-            Packet::Data(Data {
-                connection_id: connection_id,
-                data: data
-            })
-        )
-    }
-}
+use tox::toxcore::tcp::server::client::Client;
 
 #[derive(Clone)]
 struct Server {
@@ -171,7 +59,7 @@ impl Server {
     */
     fn insert(&self, client: Client) {
         self.connected_clients.borrow_mut()
-            .insert(client.pk, client);
+            .insert(client.pk(), client);
     }
     fn handle_route_request(&self, pk: &PublicKey, packet: RouteRequest) -> IoFuture<()> {
         let index = {
@@ -253,7 +141,7 @@ impl Server {
             if let Some(client) = clients.get_mut(pk) {
                 // unlink other_pk from client.links if any
                 // and return previous value
-                let link = client.links[packet.connection_id as usize - 16].take();
+                let link = client.take_link(packet.connection_id - 16);
                 if let Some(other_pk) = link {
                     other_pk
                 } else {
@@ -274,7 +162,7 @@ impl Server {
             let connection_id = other_client.get_connection_id(pk).map(|x| x + 16);
             if let Some(connection_id) = connection_id {
                 // unlink pk from other_client it and send notification
-                other_client.links[connection_id as usize].take();
+                other_client.take_link(connection_id);
                 other_client.send_disconnect_notification(connection_id)
             } else {
                 // Do nothing because
@@ -312,7 +200,7 @@ impl Server {
         }
         let clients = self.connected_clients.borrow();
         if let Some(client) = clients.get(pk) {
-            if packet.ping_id == client.ping_id {
+            if packet.ping_id == client.ping_id() {
                 Box::new( future::ok(()) )
             } else {
                 Box::new( future::err(
@@ -357,7 +245,7 @@ impl Server {
         let clients = self.connected_clients.borrow();
         let other_pk = {
             if let Some(client) = clients.get(pk) {
-                if let Some(other_pk) = client.links[packet.connection_id as usize - 16] {
+                if let Some(other_pk) = client.get_link(packet.connection_id - 16) {
                     other_pk
                 } else {
                     return Box::new( future::err(
@@ -415,7 +303,7 @@ impl Server {
                     "Can'not find client by pk to shutdown it"
             )))
         };
-        let notifications = client.links.iter()
+        let notifications = client.iter_links()
             // foreach link that is Some(other_pk)
             .filter_map(|&other_pk| other_pk)
             .map(|other_pk| {
