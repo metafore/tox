@@ -256,9 +256,8 @@ impl Server {
                         client.send_route_response(&request.peer_pk, index + 16)
                     }
                 } else {
-                    // Do nothing because
-                    // other_client has not sent RouteRequest yet to connect to this client
-                    Box::new( future::ok(()) )
+                    // if not, send RouteResponse(index + 16) only to current client
+                    client.send_route_response(&request.peer_pk, index + 16)
                 }
             },
             Packet::RouteResponse(_) => {
