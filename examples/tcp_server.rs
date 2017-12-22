@@ -26,8 +26,6 @@ extern crate nom;
 extern crate tokio_core;
 extern crate tokio_io;
 
-#[macro_use] extern crate log;
-
 use tox::toxcore::crypto_core::*;
 use tox::toxcore::tcp::*;
 use tox::toxcore::tcp::packet::*;
@@ -37,7 +35,7 @@ use std::collections::HashMap;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use futures::{Sink, Stream, Future, future};
+use futures::{Sink, Stream, Future, future, stream};
 use futures::sync::mpsc;
 
 use tokio_io::*;
@@ -64,19 +62,27 @@ impl Client {
     /// Some(index) if link exists
     /// None if no links
     fn get_connection_id(&self, to: &PublicKey) -> Option<u8> {
-        unimplemented!()
+        // rposition - backward compatibility (try to find from the end)
+        self.links.iter().rposition(|&link| link == Some(*to)).map(|x| x as u8)
     }
     /// Some(index) if has been inserted or link existed
     /// None if no free space to insert
     fn insert_connection_id(&mut self, to: &PublicKey) -> Option<u8> {
         match self.get_connection_id(to) {
-            Some(index) => Some(index),
+            Some(index) => Some(index), // already inserted
             None => {
-                unimplemented!()
+                // rposition - backward compatibility (try to insert from the end)
+                if let Some(index) = self.links.iter().rposition(|link| link.is_none()) {
+                    self.links[index] = Some(*to);
+                    Some(index as u8)
+                } else {
+                    None
+                }
             }
         }
     }
     fn send_impl(&self, packet: Packet) -> IoFuture<()> {
+        println!("Send {:?} => {:?}", self.pk, packet);
         Box::new(self.tx.clone() // clone tx sender for 1 send only
             .send(packet)
             .map(|_tx| ()) // ignore tx because it was cloned
@@ -90,7 +96,7 @@ impl Client {
     fn send(&self, packet: Packet) -> IoFuture<()> {
         Box::new(self.send_impl(packet)
             .map_err(|e| {
-                debug!("send: {:?}", e);
+                println!("send: {:?}", e);
                 e
             })
         )
@@ -98,7 +104,7 @@ impl Client {
     fn send_ignore_error(&self, packet: Packet) -> IoFuture<()> {
         Box::new(self.send_impl(packet)
             .then(|e| {
-                debug!("send_ignore_error: {:?}", e);
+                println!("send_ignore_error: {:?}", e);
                 Ok(()) // ignore if somehow failed to send it
             })
         )
@@ -165,11 +171,38 @@ impl Server {
         self.connected_clients.borrow_mut()
             .insert(client.pk, client);
     }
-    fn remove(&self, pk: &PublicKey) -> Option<Client> {
-        self.connected_clients.borrow_mut()
-            .remove(pk)
+    fn shutdown_client(&self, pk: &PublicKey) -> IoFuture<()> {
+        let client = if let Some(client) = self.connected_clients.borrow_mut().remove(pk) {
+            client
+        } else {
+            return Box::new( future::err(
+                std::io::Error::new(std::io::ErrorKind::Other,
+                    "Can'not find client by pk to shutdown it"
+            )))
+        };
+        let notifications = client.links.iter()
+            // foreach link that is Some(other_pk)
+            .filter_map(|&other_pk| other_pk)
+            .map(|other_pk| {
+                if let Some(other_client) = self.connected_clients.borrow().get(&other_pk) {
+                    // check if current pk is linked in other_pk
+                    let other_index = other_client.get_connection_id(pk).map(|x| x + 16);
+                    if let Some(other_index) = other_index {
+                        // it is linked, we should notify other_client
+                        other_client.send_disconnect_notification(other_index)
+                    } else {
+                        // Current client is not linked in other_pk
+                        Box::new( future::ok(()) )
+                    }
+                } else {
+                    // other_client is not connected to the server
+                    Box::new( future::ok(()) )
+                }
+            });
+        Box::new( stream::futures_unordered(notifications).for_each(Ok) )
     }
     fn process_packet(&self, pk: &PublicKey, packet: Packet) -> IoFuture<()> {
+        println!("Process {:?} => {:?}", pk, packet);
         match packet {
             Packet::RouteRequest(request) => {
                 let index = {
@@ -202,7 +235,7 @@ impl Server {
                     }
                 };
                 let clients = self.connected_clients.borrow();
-                let client = clients.get(&request.peer_pk).unwrap(); // can not fail
+                let client = clients.get(pk).unwrap(); // can not fail
                 if let Some(other_client) = clients.get(&request.peer_pk) {
                     // check if current pk is linked inside other_client
                     let other_index = other_client.get_connection_id(pk);
@@ -434,8 +467,9 @@ fn main() {
                 let (to_client, from_client) = secure_socket.split();
 
                 // reader = for each Packet from client process it
+                let server_inner_c_c = server_inner_c.clone();
                 let reader = from_client.for_each(move |packet| {
-                    server_inner_c.process_packet(&client_pk, packet)
+                    server_inner_c_c.process_packet(&client_pk, packet)
                 });
 
                 // writer = for each Packet from rx send it to client
@@ -449,21 +483,22 @@ fn main() {
 
                 // TODO ping request = each 30s send PingRequest to client
 
+                let server_inner_c_c = server_inner_c.clone();
                 reader.select(writer)
                     .map(|_| ())
                     .map_err(move |(err, _select_next)| {
                         println!("Processing client {:?} ended with error: {:?}", &client_pk, err);
                         err
                     })
-                    .then(move |r| {
-                        // TODO shutdown client, send notifications etc
+                    .then(move |r_processing| {
                         println!("shutdown PK {:?}", &client_pk);
-                        future::result(r)
+                        server_inner_c_c.shutdown_client(&client_pk)
+                            .then(move |r_shutdown| r_processing.and(r_shutdown))
                     })
             });
         handle.spawn(process_connection.then(|r| {
             println!("end of processing with result {:?}", r);
-            future::ok(())
+            Ok(())
         }));
 
         Ok(())
